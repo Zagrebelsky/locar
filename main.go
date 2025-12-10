@@ -58,11 +58,12 @@ type resultStore struct {
 }
 
 type Result struct {
-	name  string
-	ino   uint64
-	atime time.Time
-	mtime time.Time
-	ctime time.Time
+	name   string
+	ino    uint64
+	atime  time.Time
+	mtime  time.Time
+	ctime  time.Time
+	isLink bool
 }
 
 // TimeCondition represents conditions to filter by a specific time type
@@ -102,6 +103,7 @@ type Explorer struct {
 	ctimeNewerThan time.Duration
 
 	delete         bool
+	deleteLinks    bool
 	deleteAll      bool
 	includeDirs    bool
 	includeFiles   bool
@@ -211,10 +213,11 @@ func (e *Explorer) checkFileTimeConditions(fullpath string) (Result, bool, error
 
 	// All conditions passed
 	return Result{
-		name:  fullpath,
-		atime: atime,
-		mtime: mtime,
-		ctime: ctime,
+		name:   fullpath,
+		atime:  atime,
+		mtime:  mtime,
+		ctime:  ctime,
+		isLink: false,
 	}, true, nil
 }
 
@@ -244,9 +247,10 @@ func createTimeConditions(olderThanInput, newerThanInput *time.Duration) (timeCo
 }
 
 // GetFileTimes returns the atime, mtime, and ctime of a file
+// Uses Lstat to not follow symlinks (works with broken symlinks)
 func GetFileTimes(path string) (atime, mtime, ctime time.Time, err error) {
 
-	fileInfo, err := os.Stat(path)
+	fileInfo, err := os.Lstat(path)
 	if err != nil {
 		return time.Time{}, time.Time{}, time.Time{}, err
 	}
@@ -317,18 +321,27 @@ func (e *Explorer) dumpResults() {
 
 			// Delete ignore non empty dir
 			if e.delete {
-				err := os.Remove(result.name)
-				if err != nil {
-					log.Printf("Delete failed: %s - Error: %v\n", result.name, err)
-					outputBuffer.WriteString(" [delete_failed]")
-				} else {
-					log.Printf("Delete success: %s\n", result.name)
-					outputBuffer.WriteString(" [delete_success]")
+				shouldDelete := true
+				if result.isLink && !e.deleteLinks {
+					_, err := os.Stat(result.name)
+					if err == nil || !os.IsNotExist(err) {
+						shouldDelete = false
+						outputBuffer.WriteString(" [symlink_skipped]")
+					}
 				}
-			}
 
-			// Delete not ignore non empty dir
-			if e.deleteAll {
+				if shouldDelete {
+					err := os.Remove(result.name)
+					if err != nil {
+						log.Printf("Delete failed: %s - Error: %v\n", result.name, err)
+						outputBuffer.WriteString(" [delete_failed]")
+					} else {
+						log.Printf("Delete success: %s\n", result.name)
+						outputBuffer.WriteString(" [delete_success]")
+					}
+				}
+			} else if e.deleteAll {
+				// Delete not ignore non empty dir - delete everything including all symlinks
 				err := os.RemoveAll(result.name)
 				if err != nil {
 					log.Printf("Delete failed: %s - Error: %v\n", result.name, err)
@@ -590,7 +603,7 @@ func (e *Explorer) readdir(dir string) {
 						}
 						results = append(results, result)
 					} else {
-						results = append(results, Result{fullpath + string(filepath.Separator), GetIno(dirent), time.Time{}, time.Time{}, time.Time{}})
+						results = append(results, Result{fullpath + string(filepath.Separator), GetIno(dirent), time.Time{}, time.Time{}, time.Time{}, false})
 					}
 				}
 			case syscall.DT_REG:
@@ -603,7 +616,7 @@ func (e *Explorer) readdir(dir string) {
 						}
 						results = append(results, result)
 					} else {
-						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}})
+						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}, false})
 					}
 				}
 			case syscall.DT_LNK:
@@ -614,9 +627,10 @@ func (e *Explorer) readdir(dir string) {
 						if err != nil || !ok {
 							continue
 						}
+						result.isLink = true
 						results = append(results, result)
 					} else {
-						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}})
+						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}, true})
 					}
 				}
 			case syscall.DT_SOCK:
@@ -629,7 +643,7 @@ func (e *Explorer) readdir(dir string) {
 						}
 						results = append(results, result)
 					} else {
-						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}})
+						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}, false})
 					}
 				}
 			default:
@@ -642,7 +656,7 @@ func (e *Explorer) readdir(dir string) {
 						}
 						results = append(results, result)
 					} else {
-						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}})
+						results = append(results, Result{fullpath, GetIno(dirent), time.Time{}, time.Time{}, time.Time{}, false})
 					}
 				} else {
 					log.Printf("Skipped record: %s iNode<%d>[type:%s]\n", fullpath, GetIno(dirent), entryType(dirent.Type))
@@ -672,6 +686,7 @@ type Options struct {
 	CtimeNewerThan time.Duration `long:"ctime-newer" description:"Filter files by change time newer than this duration (e.g., 24h5m25s)" default:"0s"`
 	ResultThreads  int           `long:"result-jobs" description:"Number of jobs for processing results, like doing stats to get file sizes" default:"128"`
 	Delete         bool          `long:"delete" description:"Delete found files. Non empty directories will be ignored"`
+	DeleteLinks    bool          `long:"delete-links" description:"Delete symlinks even if target exists"`
 	DeleteAll      bool          `long:"delete-all" description:"Delete found files. Non empty directories will be removed with ALL their contents!!!"`
 	Version        bool          `short:"v" long:"version" description:"Show version"`
 
@@ -737,6 +752,7 @@ func main() {
 	explorer.ctimeOlderThan = opts.CtimeOlderThan
 	explorer.ctimeNewerThan = opts.CtimeNewerThan
 	explorer.delete = opts.Delete
+	explorer.deleteLinks = opts.DeleteLinks
 	explorer.deleteAll = opts.DeleteAll
 
 	for _, exclude := range opts.Exclude {
